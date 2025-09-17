@@ -18,7 +18,7 @@ spec:
       source:
         repoURL: https://github.com/arthur-16/ArgoRepo
         targetRevision: main
-        path: demo
+        path: appRepo
         helm:
           valueFiles:
             - values-dev.yaml
