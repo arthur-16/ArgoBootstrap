@@ -16,7 +16,7 @@ spec:
     spec:
       project: demo
       source:
-        repoURL: https://github.com/your-org/app-repo.git
+        repoURL: https://github.com/arthur-16/ArgoRepo
         targetRevision: main
         path: demo
         helm:
