@@ -1,0 +1,32 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: demo-fleet
+  namespace: argocd
+spec:
+  generators:
+  - list:
+      elements:
+        - { name: demo-0, ns: demo-0 }
+        - { name: demo-1, ns: demo-1 }
+        # add more or generate with your bootstrap script
+  template:
+    metadata:
+      name: '{{name}}'
+    spec:
+      project: demo
+      source:
+        repoURL: https://github.com/arthur-16/ArgoRepo
+        targetRevision: main
+        path: appRepo
+        helm:
+          valueFiles:
+            - values-dev.yaml
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{ns}}'
+      syncPolicy:
+        automated: { prune: true, selfHeal: true }
+        syncOptions:
+          - CreateNamespace=true
+          - ApplyOutOfSyncOnly=true

@@ -1,0 +1,19 @@
+datadog:
+  site: "datadoghq.com"
+  clusterName: "argodemo"
+  apiKeyExistingSecret: "datadog-secret"
+  tags:
+    - "env:dev"
+  kubelet:
+    tlsVerify: false
+  apm:
+    instrumentation:
+      enabled: true
+      targets:
+        - name: "default-target"
+          ddTraceVersions:
+            python: "3"
+  logs:
+    enabled: true
+    containerCollectAll: true
+registry: "gcr.io/datadoghq"
