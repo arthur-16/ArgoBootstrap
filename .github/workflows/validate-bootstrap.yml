@@ -1,0 +1,146 @@
+name: validate-bootstrap
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+env:
+  # Flip to "true" when you’re ready to enforce commit-SHA pinning for Git sources.
+  ENFORCE_PINNED_REFS: "false"
+  # Argo app repo and expected chart path inside it:
+  APP_REPO_URL: "https://github.com/arthur-16/ArgoRepo"
+  APP_CHART_PATH: "."
+  APP_VALUE_FILE: "values-dev.yaml"
+  # Datadog Helm chart version you intend to pin (adjust as you choose):
+  DATADOG_CHART_VERSION: "3.53.2"
+  KUBE_VERSION: "1.29.0"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bootstrap repo
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+          | tar -xz kubeconform && sudo mv kubeconform /usr/local/bin/
+
+      - name: Install yq (mikefarah)
+        uses: mikefarah/yq@v4.44.3
+
+      # ─────────────────────────────────────────
+      # 0) Fast YAML sanity (catch malformed files early)
+      # ─────────────────────────────────────────
+      - name: YAML sanity (parse all .yaml)
+        run: |
+          python - <<'PY'
+          import sys, yaml, glob
+          bad = []
+          for f in glob.glob('**/*.yaml', recursive=True):
+              try:
+                  yaml.safe_load(open(f))
+              except Exception as e:
+                  bad.append((f, str(e)))
+          if bad:
+              for f,e in bad:
+                  print(f"[YAML ERROR] {f}: {e}")
+              sys.exit(1)
+          PY
+
+      # ─────────────────────────────────────────
+      # 1) Guardrails tailored to your layout
+      #    - ApplicationSet(s) that point to ArgoRepo must use path=appRepo and include values-dev.yaml
+      #    - AppProject must allow ArgoRepo + Datadog Helm repo
+      #    - Forbid ':latest' anywhere
+      #    - (optional) Enforce targetRevision pinned (commit SHA for Git, version for Helm)
+      # ─────────────────────────────────────────
+      - name: Guardrails – ApplicationSet (path & values)
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=$(git ls-files '*.yaml' | tr '\n' ' ')
+          # For each ApplicationSet template that references your ArgoRepo, assert path and valueFiles
+          fail=0
+          for f in $files; do
+            kind=$(yq e '.kind // ""' "$f")
+            if [[ "$kind" == "ApplicationSet" ]]; then
+              repo=$(yq e '.spec.template.spec.source.repoURL // ""' "$f")
+              if [[ "$repo" == "${APP_REPO_URL}" ]]; then
+                path=$(yq e '.spec.template.spec.source.path // ""' "$f")
+                if [[ "$path" != "${APP_CHART_PATH}" ]]; then
+                  echo "::error file=$f::ApplicationSet.source.path must be '${APP_CHART_PATH}' (found '${path}')"
+                  fail=1
+                fi
+                # Must contain values-dev.yaml somewhere in helm.valueFiles
+                if ! yq e ".spec.template.spec.source.helm.valueFiles[] | select(. == \"${APP_VALUE_FILE}\")" "$f" >/dev/null; then
+                  echo "::error file=$f::ApplicationSet.helm.valueFiles must include '${APP_VALUE_FILE}'"
+                  fail=1
+                fi
+              fi
+            fi
+          done
+          exit $fail
+
+      - name: Guardrails – AppProject allows ArgoRepo + Datadog repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          f=$(git ls-files 'projects/*.yaml' | head -n1 || true)
+          if [[ -z "$f" ]]; then
+            echo "::warning::No projects/*.yaml found (skipping AppProject checks)"; exit 0
+          fi
+          have_repo=$(yq e ".spec.sourceRepos[] | select(. == \"${APP_REPO_URL}\")" "$f" || true)
+          have_dd=$(yq e '.spec.sourceRepos[] | select(. == "https://helm.datadoghq.com")' "$f" || true)
+          if [[ -z "$have_repo" ]]; then
+            echo "::error file=$f::AppProject.spec.sourceRepos must include ${APP_REPO_URL}"
+            exit 1
+          fi
+          if [[ -z "$have_dd" ]]; then
+            echo "::error file=$f::AppProject.spec.sourceRepos must include https://helm.datadoghq.com"
+            exit 1
+          fi
+
+      - name: Guardrails – forbid mutable ':latest' images anywhere
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R --line-number -E 'image:.*:latest(\s|$)' .; then
+            echo "::error::Found ':latest' image tag(s). Pin images (prefer @sha256)."
+            exit 1
+          fi
+
+      - name: Guardrails – enforce pinned refs (optional)
+        if: env.ENFORCE_PINNED_REFS == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Forbid Git targetRevision: main/master (require commit SHA)
+          bad=$(yq e '.. | select(has("targetRevision")) | .targetRevision' -o=j -I=0 **/*.yaml \
+                | jq -r '. | arrays + objects | ..? // empty | select(type=="string")' \
+                | grep -E '^(main|master)$' || true)
+          if [[ -n "$bad" ]]; then
+            echo "::error::Use a commit SHA for targetRevision, not 'main'/'master'."
+            exit 1
+          fi
+
+      # ─────────────────────────────────────────
+      # 2) Render Datadog chart with your pinned version + values
+      # ─────────────────────────────────────────
+      - name: Render Datadog chart
+        run: |
+          helm repo add datadog https://helm.datadoghq.com
+          if [[ ! -f datadog/datadog-values.yaml ]]; then
+            echo "::error::Missing datadog/datadog-values.yaml"; exit 1
+          fi
+          helm template dd datadog/datadog \
+            --version "${DATADOG_CHART_VERSION}" \
+            --namespace datadog \
+            -f datadog/datadog-values.yaml > /tmp/datadog.yaml
+
+      - name: Schema-validate Datadog manifests (K8s ${{ env.KUBE_VERSION }})
+        run: kubeconform -kubernetes-version "${KUBE_VERSION}" -strict -ignore-missing-schemas /tmp/datadog.yaml
